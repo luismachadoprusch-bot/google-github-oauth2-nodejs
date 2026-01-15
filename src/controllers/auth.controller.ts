@@ -1,24 +1,35 @@
-import { NextFunction, Request, Response } from "express";
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
+import { prisma } from "../utils/prisma";
 import { CreateUserInput, LoginUserInput } from "../schema/user.schema";
 import {
-  getGithubOathToken,
-  getGithubUser,
   getGoogleOauthToken,
   getGoogleUser,
+  getGithubOathToken,
+  getGithubUser,
 } from "../services/session.service";
-import { prisma } from "../utils/prisma";
-import jwt from "jsonwebtoken";
 
-export function exclude<User, Key extends keyof User>(
-  user: User,
-  keys: Key[]
-): Omit<User, Key> {
-  for (let key of keys) {
-    delete user[key];
-  }
-  return user;
-}
+/* Utils */
+const TOKEN_EXPIRES_IN = Number(process.env.TOKEN_EXPIRES_IN);
+const TOKEN_SECRET = process.env.JWT_SECRET as string;
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN as string;
 
+const signAndSetCookie = (res: Response, userId: string) => {
+  const token = jwt.sign({ sub: userId }, TOKEN_SECRET, {
+    expiresIn: `${TOKEN_EXPIRES_IN}m`,
+  });
+
+  res.cookie("token", token, {
+    expires: new Date(Date.now() + TOKEN_EXPIRES_IN * 60 * 1000),
+  });
+};
+
+export const exclude = <T, K extends keyof T>(obj: T, keys: K[]) => {
+  keys.forEach((k) => delete obj[k]);
+  return obj;
+};
+
+/* Auth */
 export const registerHandler = async (
   req: Request<{}, {}, CreateUserInput>,
   res: Response,
@@ -26,19 +37,12 @@ export const registerHandler = async (
 ) => {
   try {
     const user = await prisma.user.create({
-      data: {
-        name: req.body.name,
-        email: req.body.email,
-        password: req.body.password,
-        createdAt: new Date(),
-      },
+      data: { ...req.body, createdAt: new Date() },
     });
 
     res.status(201).json({
       status: "success",
-      data: {
-        user: exclude(user, ["password"]),
-      },
+      data: { user: exclude(user, ["password"]) },
     });
   } catch (err: any) {
     if (err.code === "P2002") {
@@ -61,71 +65,63 @@ export const loginHandler = async (
       where: { email: req.body.email },
     });
 
-    if (!user) {
+    if (!user || user.provider !== "Credentials") {
       return res.status(401).json({
         status: "fail",
-        message: "Invalid email or password",
+        message: user
+          ? `Use ${user.provider} OAuth2 instead`
+          : "Invalid email or password",
       });
     }
 
-    if (user.provider === "Google" || user.provider === "GitHub") {
-      return res.status(401).json({
-        status: "fail",
-        message: `Use ${user.provider} OAuth2 instead`,
-      });
-    }
-
-    const TOKEN_EXPIRES_IN = process.env.TOKEN_EXPIRES_IN as unknown as number;
-    const TOKEN_SECRET = process.env.JWT_SECRET as unknown as string;
-    const token = jwt.sign({ sub: user.id }, TOKEN_SECRET, {
-      expiresIn: `${TOKEN_EXPIRES_IN}m`,
-    });
-
-    res.cookie("token", token, {
-      expires: new Date(Date.now() + TOKEN_EXPIRES_IN * 60 * 1000),
-    });
-
-    res.status(200).json({
-      status: "success",
-    });
-  } catch (err: any) {
+    signAndSetCookie(res, user.id);
+    res.status(200).json({ status: "success" });
+  } catch (err) {
     next(err);
   }
 };
 
-export const logoutHandler = async (
-  req: Request,
+export const logoutHandler = (_: Request, res: Response) => {
+  res.cookie("token", "", { maxAge: -1 });
+  res.status(200).json({ status: "success" });
+};
+
+/* OAuth */
+const oauthLogin = async (
   res: Response,
-  next: NextFunction
-) => {
-  try {
-    res.cookie("token", "", { maxAge: -1 });
-    res.status(200).json({ status: "success" });
-  } catch (err: any) {
-    next(err);
+  pathUrl: string,
+  userData: {
+    email: string;
+    name: string;
+    photo?: string;
+    provider: "Google" | "GitHub";
   }
+) => {
+  const user = await prisma.user.upsert({
+    where: { email: userData.email },
+    create: {
+      ...userData,
+      password: "",
+      verified: true,
+      createdAt: new Date(),
+    },
+    update: userData,
+  });
+
+  signAndSetCookie(res, user.id);
+  res.redirect(`${FRONTEND_ORIGIN}${pathUrl}`);
 };
 
 export const googleOauthHandler = async (req: Request, res: Response) => {
-  const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN as unknown as string;
-
   try {
     const code = req.query.code as string;
     const pathUrl = (req.query.state as string) || "/";
 
-    if (!code) {
-      return res.status(401).json({
-        status: "fail",
-        message: "Authorization code not provided!",
-      });
-    }
+    if (!code) throw new Error("Missing code");
 
     const { id_token, access_token } = await getGoogleOauthToken({ code });
-
-    const { name, verified_email, email, picture } = await getGoogleUser({
-      id_token,
-      access_token,
-    });
+    const { email, name, picture, verified_email } =
+      await getGoogleUser({ id_token, access_token });
 
     if (!verified_email) {
       return res.status(403).json({
@@ -134,89 +130,38 @@ export const googleOauthHandler = async (req: Request, res: Response) => {
       });
     }
 
-    const user = await prisma.user.upsert({
-      where: { email },
-      create: {
-        createdAt: new Date(),
-        name,
-        email,
-        photo: picture,
-        password: "",
-        verified: true,
-        provider: "Google",
-      },
-      update: { name, email, photo: picture, provider: "Google" },
+    await oauthLogin(res, pathUrl, {
+      email,
+      name,
+      photo: picture,
+      provider: "Google",
     });
-
-    if (!user) return res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
-
-    const TOKEN_EXPIRES_IN = process.env.TOKEN_EXPIRES_IN as unknown as number;
-    const TOKEN_SECRET = process.env.JWT_SECRET as unknown as string;
-    const token = jwt.sign({ sub: user.id }, TOKEN_SECRET, {
-      expiresIn: `${TOKEN_EXPIRES_IN}m`,
-    });
-
-    res.cookie("token", token, {
-      expires: new Date(Date.now() + TOKEN_EXPIRES_IN * 60 * 1000),
-    });
-
-    res.redirect(`${FRONTEND_ORIGIN}${pathUrl}`);
-  } catch (err: any) {
-    console.log("Failed to authorize Google User", err);
-    return res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
+  } catch {
+    res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
   }
 };
 
 export const githubOauthHandler = async (req: Request, res: Response) => {
-  const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN as unknown as string;
-
   try {
-    const code = req.query.code as string;
-    const pathUrl = (req.query.state as string) ?? "/";
-
     if (req.query.error) {
       return res.redirect(`${FRONTEND_ORIGIN}/login`);
     }
 
-    if (!code) {
-      return res.status(401).json({
-        status: "error",
-        message: "Authorization code not provided!",
-      });
-    }
+    const code = req.query.code as string;
+    const pathUrl = (req.query.state as string) || "/";
+
+    if (!code) throw new Error("Missing code");
 
     const { access_token } = await getGithubOathToken({ code });
+    const { email, login, avatar_url } = await getGithubUser({ access_token });
 
-    const { email, avatar_url, login } = await getGithubUser({ access_token });
-
-    const user = await prisma.user.upsert({
-      where: { email },
-      create: {
-        createdAt: new Date(),
-        name: login,
-        email,
-        photo: avatar_url,
-        password: "",
-        verified: true,
-        provider: "GitHub",
-      },
-      update: { name: login, email, photo: avatar_url, provider: "GitHub" },
+    await oauthLogin(res, pathUrl, {
+      email,
+      name: login,
+      photo: avatar_url,
+      provider: "GitHub",
     });
-
-    if (!user) return res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
-
-    const TOKEN_EXPIRES_IN = process.env.TOKEN_EXPIRES_IN as unknown as number;
-    const TOKEN_SECRET = process.env.JWT_SECRET as unknown as string;
-    const token = jwt.sign({ sub: user.id }, TOKEN_SECRET, {
-      expiresIn: `${TOKEN_EXPIRES_IN}m`,
-    });
-
-    res.cookie("token", token, {
-      expires: new Date(Date.now() + TOKEN_EXPIRES_IN * 60 * 1000),
-    });
-
-    res.redirect(`${FRONTEND_ORIGIN}${pathUrl}`);
-  } catch (err: any) {
-    return res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
+  } catch {
+    res.redirect(`${FRONTEND_ORIGIN}/oauth/error`);
   }
 };
